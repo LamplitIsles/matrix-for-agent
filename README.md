@@ -85,7 +85,8 @@ chronological homeserver timeline order. `limit` bounds scanned **events**, so
 filtering media/edits can produce an empty or underfilled message page even when
 `next_batch` remains available. No read markers, receipts or notifications are sent.
 
-A message contains `event_id`, `sender_id`, `timestamp` (milliseconds), `body`,
+A message contains `event_id`, `sender_id`, `sender_display_name`, `timestamp`
+(milliseconds), `body`,
 `mentions` (user IDs), optional `reply_to_event_id`, and `edited`, `redacted`,
 `incomplete`, `truncated` flags. Known redactions omit `body`; a redacted message
 whose former type is unknown may appear as a bodyless placeholder. Bodies are
@@ -93,6 +94,12 @@ capped at 16,000 characters, mentions at 100 IDs of 255 characters each, and the
 serialized message array at 64,000 characters of records. Dropped/truncated
 content is disclosed. Pagination follows the scanned page, including dropped
 records; ask for smaller limits when encountering output truncation.
+
+`sender_display_name` is the best-effort current synced room member name for the
+original sender, capped at 255 UTF-16 code units; unknown members or names yield
+an empty string. It is included on redacted messages and counts toward the total
+response budget. It is not a historical nickname snapshot or an identity assertion.
+Reading does not fetch profiles or load additional members to resolve names.
 
 Only valid same-original-author replacements available in the server's bundled
 relations or current page are applied, choosing the newest timestamp (event ID

@@ -214,7 +214,7 @@ export class Matrix {
       limit,
       Direction.Backward,
     );
-    this.room(id);
+    const room = this.room(id);
     const events = (page.chunk.slice(0, limit) as Event[]).map((e) => ({
       ...e,
       room_id: e.room_id ?? id,
@@ -222,7 +222,18 @@ export class Matrix {
     let size = 0,
       truncated = false;
     const messages = events
-      .map((e) => record(e, events))
+      .map((e) => {
+        const message = record(e, events);
+        return message
+          ? {
+              ...message,
+              sender_display_name: clip(
+                room.getMember(e.sender ?? "")?.name,
+                255,
+              ),
+            }
+          : null;
+      })
       .filter((e) => e !== null)
       .reverse()
       .filter((e) => {

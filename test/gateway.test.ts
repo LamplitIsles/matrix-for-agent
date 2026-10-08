@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { createServer, type RequestListener } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Matrix, record, type Event } from "../src/matrix.js";
+import { Matrix, record, TOTAL, type Event } from "../src/matrix.js";
 import { config } from "../src/config.js";
 import { listen } from "../src/mcp.js";
 import { Webhook } from "../src/webhook.js";
@@ -49,14 +49,20 @@ function fake() {
     content: unknown,
     chunk: Event[] | undefined,
     count = 1,
+    memberLoads = 0,
     uncertain = false,
     lookup: () => void = () => {};
+  const names = new Map<string, string | undefined>([["@other:test", "Other"]]);
   const room = {
     roomId: "!room:test",
     name: "Room",
+    getMember: (id: string) =>
+      names.has(id) ? { name: names.get(id) } : null,
     getMyMembership: () => membership,
     currentState: { getStateEvents: () => (encrypted ? {} : null) },
-    loadMembersIfNeeded: async () => {},
+    loadMembersIfNeeded: async () => {
+      memberLoads++;
+    },
     getJoinedMembers: () =>
       Array.from({ length: count }, () => ({
         userId: "@other:test",
@@ -89,6 +95,10 @@ function fake() {
   matrix.identity = { user_id: "@self:test", device_id: "TEST" };
   return {
     matrix,
+    names,
+    get memberLoads() {
+      return memberLoads;
+    },
     set chunk(v: Event[]) {
       chunk = v;
     },
@@ -192,11 +202,14 @@ test("public stateless HTTP MCP tools, auth, scope, sends and history", async ()
       (await call("list_room_members", { room_id: "!room:test" })).value
         .members[0].user_id,
     ).toBe("@other:test");
+    const history = (await call("read_messages", { room_id: "!room:test" }))
+      .value;
+    expect(history.messages.map((m: any) => m.event_id)).toEqual([
+      "$self", "$new",
+    ]);
     expect(
-      (
-        await call("read_messages", { room_id: "!room:test" })
-      ).value.messages.map((m: any) => m.event_id),
-    ).toEqual(["$self", "$new"]);
+      history.messages.map((m: any) => [m.sender_id, m.sender_display_name]),
+    ).toEqual([["@self:test", ""], ["@other:test", "Other"]]);
     expect(
       (await call("read_messages", { room_id: "!room:test", before: "older" }))
         .value.messages[0].event_id,
@@ -243,10 +256,12 @@ test("public stateless HTTP MCP tools, auth, scope, sends and history", async ()
     f.chunk = [
       text("$redacted", "former body", { unsigned: { redacted_because: {} } }),
     ];
-    expect(
-      (await call("read_messages", { room_id: "!room:test" })).value
-        .messages[0],
-    ).not.toHaveProperty("body");
+    f.names.set("@other:test", "😀".repeat(130));
+    const redacted = (await call("read_messages", { room_id: "!room:test" }))
+      .value.messages[0];
+    expect(redacted).not.toHaveProperty("body");
+    expect(redacted.sender_display_name).toBe("😀".repeat(130).slice(0, 255));
+    expect(redacted.redacted).toBe(true);
     f.uncertain = true;
     const uncertain = await call("send_message", {
       room_id: "!room:test",
@@ -280,6 +295,32 @@ test("public stateless HTTP MCP tools, auth, scope, sends and history", async ()
     await Promise.all(clients.map((c) => c.close()));
     await gateway.stop();
   }
+});
+test("history uses current names without loading members and budgets enriched records", async () => {
+  const f = fake();
+  f.chunk = Array.from({ length: 4 }, (_, i) =>
+    text(`$budget${i}`, "x".repeat(15800)),
+  );
+  f.names.set("@other:test", undefined);
+  const unnamed = await f.matrix.read("!room:test", 4, "older");
+  expect(unnamed.messages).toHaveLength(4);
+  expect(unnamed.messages.every((m) => m.sender_display_name === "")).toBe(true);
+  expect(unnamed.truncated).toBe(false);
+  f.names.set("@other:test", "n".repeat(255));
+  const named = await f.matrix.read("!room:test", 4, "older");
+  expect(named.messages.map((m) => m.event_id)).toEqual([
+    "$budget3", "$budget2", "$budget1",
+  ]);
+  expect(
+    named.messages.every((m) => m.sender_display_name === "n".repeat(255)),
+  ).toBe(true);
+  expect(
+    named.messages.reduce((size, m) => size + JSON.stringify(m).length, 0),
+  ).toBeLessThanOrEqual(TOTAL);
+  expect(named.truncated).toBe(true);
+  expect(named.incomplete).toBe(true);
+  expect(named.next_batch).toBe("end");
+  expect(f.memberLoads).toBe(0);
 });
 test("bounded edit/redaction resolution, ordinary replies and thread text", () => {
   const original = text("$a", "old");
