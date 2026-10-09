@@ -1,9 +1,10 @@
 # Matrix for Agent
 
-A small plaintext Matrix gateway for any agent host. One process owns one Matrix
-user connection, exposes five tools over loopback HTTP MCP, and optionally posts
-new incoming text to one webhook receiver. The receiver decides how to route
-messages and whether an agent responds.
+A small plaintext Matrix gateway for any agent host. One process connects to one
+fixed Matrix homeserver and exposes five tools over loopback HTTP MCP. Each caller
+uses its own Matrix access token. Independently configured identities synchronize
+continuously and post new incoming text to their own webhook receivers. Each
+receiver decides how to route messages and whether an agent responds.
 
 ## Run
 
@@ -19,35 +20,131 @@ bun run build
 node dist/cli.js --help
 
 export MATRIX_HOMESERVER_URL=https://matrix.example.org
-export MATRIX_ACCESS_TOKEN='<existing Matrix access token>'
 node dist/cli.js
 ```
 
 The build creates a Node-compatible executable at `dist/cli.js`. `bun run start`
 also starts it. SIGINT/SIGTERM close the listener, Matrix requests, event listeners,
-webhook requests and timers. All state is ephemeral; no database or crypto store
-is created. The process discovers its user/device IDs through Matrix `whoami`.
+webhook requests and gateway timers. All state is ephemeral; no database or crypto
+store is created. The gateway verifies each credential's user/device IDs through
+Matrix `whoami`. The SDK may retain baseline Node process resources after SIGTERM
+even after HTTP closes; operators should use a finite service stop timeout and
+forced termination for a process that remains. No delayed gateway sends or webhook
+POSTs survive shutdown.
+
+If `dist/cli.js` is an installed live artifact, build and smoke-test an owned output
+instead of replacing it:
+
+```sh
+mkdir -p .scratch/multi-identity-gateway
+sha256sum dist/cli.js
+bun build src/cli.ts --target=node --outfile=.scratch/multi-identity-gateway/cli.js
+node .scratch/multi-identity-gateway/cli.js --help
+sha256sum dist/cli.js
+```
+
+The before/after live artifact hashes must match. Package only the copied owned
+output in an isolated staging directory when verifying a release artifact.
 
 ## Configuration and MCP connection
 
-| Environment variable          | Meaning                                                                                 |
-| ----------------------------- | --------------------------------------------------------------------------------------- |
-| `MATRIX_HOMESERVER_URL`       | Required HTTPS or intentional HTTP homeserver URL, without URL credentials or fragment. |
-| `MATRIX_ACCESS_TOKEN`         | Required nonempty Matrix-issued bearer token. No minimum length rule.                   |
-| `MATRIX_MCP_LISTEN`           | Loopback host:port, default `127.0.0.1:8766`; `localhost` and `[::1]` also accepted.    |
-| `MATRIX_WEBHOOK_URL`          | Optional single receiver: HTTPS, or loopback HTTP; no URL credentials or fragment.      |
-| `MATRIX_WEBHOOK_BEARER_TOKEN` | Optional receiver-issued bearer, requires webhook URL.                                  |
+| Environment variable    | Meaning                                                                                       |
+| ----------------------- | --------------------------------------------------------------------------------------------- |
+| `MATRIX_HOMESERVER_URL` | Required fixed HTTPS or intentional HTTP homeserver URL, without URL credentials or fragment. |
+| `MATRIX_MCP_LISTEN`     | Loopback host:port, default `127.0.0.1:8766`; `localhost` and `[::1]` also accepted.          |
+| `MATRIX_WEBHOOK_CONFIG` | Optional path to a private UTF-8 JSON webhook configuration file; absent means MCP-only.      |
+
+`MATRIX_ACCESS_TOKEN`, `MATRIX_WEBHOOK_URL` and `MATRIX_WEBHOOK_BEARER_TOKEN` are
+obsolete. Supplying any of them, even an empty value, fails startup. Remove them
+when converting a future service configuration. Existing deployed artifacts and
+secret files are not converted by this source change.
 
 Configure your host's Streamable HTTP MCP client with URL
-`http://127.0.0.1:8766/mcp` and header `Authorization: Bearer <MATRIX_ACCESS_TOKEN>`.
-Every request method requires authorization. Authenticated GET/DELETE return 405;
-there is no persistent SSE stream or session ID. Independent concurrent clients
-share the same Matrix connection. POST bodies are capped at 128,000 bytes.
+`http://127.0.0.1:8766/mcp` and header
+`Authorization: Bearer <that caller's existing Matrix access token>`. There is no
+identity argument, registration step or caller-selected homeserver. Every request
+method validates the credential with the fixed homeserver's `whoami`, including
+access to a resident client. Missing/malformed or upstream-invalid credentials
+return 401; upstream failures/timeouts, identity changes, cold synchronization
+failure or capacity exhaustion return a sanitized 503. A prior successful request
+never authorizes a later request by itself. This custom Matrix bearer scheme is
+**not standard MCP OAuth** and introduces no separate gateway token.
+
+Authenticated off-path requests return 404 and GET/DELETE on `/mcp` return 405;
+these validations do not create persistent dynamic clients. There is no persistent
+SSE stream or session ID. POST bodies are capped at 128,000 bytes; oversized bodies
+return 413 and malformed JSON returns 400 after authorization. The Authorization
+header must occur exactly once and contain one Bearer credential, with no extra
+whitespace; tokens are 1–16,384 visible ASCII characters without whitespace.
+
+Concurrent callers with the exact same credential share initialization and one
+Matrix client. Distinct credentials have separate clients, room state and
+operations, even when their full Matrix user IDs match. On first use, initial usable
+sync is awaited for at most ten seconds before tools can access rooms. Each
+`whoami` validation is bounded to ten seconds including response-body transfer.
+There are at most 16 concurrent authentication/initialization admissions and at
+most 16 initializing or resident dynamic clients. Overflow returns 503. Dynamic
+clients expire after five idle minutes, with cleanup at most 30 seconds later;
+in-use requests protect their client until the last request releases it. Expired
+idle clients may be removed to admit a new client at capacity. Failed creation is
+removed so a later request can try again. A disconnected waiter releases only its
+ownership; creation is cancelled when its last waiter leaves. Configured background
+clients have separate capacity and remain active without MCP callers.
 
 Local MCP callers knowingly hold the **full Matrix account credential**. The
-listener accepts only loopback connections. The Matrix credential is never
-attached to a webhook; only the separate receiver bearer is used there. Errors
-and diagnostics omit credentials, headers and server error details.
+listener accepts only loopback connections. Credentials are never logged or
+persisted from requests. Errors and diagnostics omit credentials, headers and
+upstream error details. The Matrix credential is never attached to a webhook;
+only its separate receiver bearer is sent there.
+
+### Configured webhook identities
+
+`MATRIX_WEBHOOK_CONFIG` reads one file once at startup: a top-level JSON array of
+at most 16 closed objects. The file is at most 1 MiB and must be valid UTF-8 JSON;
+an empty array is valid. Each entry has exactly these fields:
+
+| Field          | Contract                                                                                            |
+| -------------- | --------------------------------------------------------------------------------------------------- |
+| `user_id`      | Required exact full Matrix user ID, at most 255 UTF-16 code units, matching `/^@[^\s:]+:[^\s]+$/u`. |
+| `access_token` | Required Matrix token: 1–16,384 visible ASCII characters without whitespace.                        |
+| `url`          | Required receiver URL: HTTPS, or loopback HTTP; no URL credentials or fragment.                     |
+| `bearer_token` | Optional receiver-issued credential: 1–16,384 visible ASCII characters without whitespace.          |
+
+Unknown fields, duplicate user IDs or duplicate access tokens, malformed endpoints,
+and unreadable/invalid files fail startup with sanitized diagnostics. Store this
+file with private permissions (for example 0600) outside the source tree. Example
+with placeholders only:
+
+```json
+[
+  {
+    "user_id": "@shio:example.org",
+    "access_token": "<Shio-Matrix-token>",
+    "url": "https://shio-receiver.example.org/matrix",
+    "bearer_token": "<Shio-receiver-token>"
+  },
+  {
+    "user_id": "@serein:example.org",
+    "access_token": "<Serein-Matrix-token>",
+    "url": "https://serein-receiver.example.org/matrix"
+  }
+]
+```
+
+For a future conversion, place each former identity's Matrix token and receiver
+settings into its own object in a new private file, remove the three obsolete
+variables, set `MATRIX_WEBHOOK_CONFIG=/private/path/webhooks.json`, and keep the
+fixed homeserver and loopback listener. Conversion and deployment are separate
+operator work; there is no migration, reload, login or credential refresh API.
+
+Every entry must authenticate, match its exact configured `user_id`, and reach
+initial usable sync before the listener opens. Startup is all-or-nothing: failure
+stops all already-created observers, clients and queues. Observation starts before
+sync to preserve the conservative no-replay boundary. Each configured runtime owns
+its independent webhook queue and receiver credential; one receiver's retries do
+not block another. An MCP caller with the exact configured Matrix token reuses
+that client without another observer or changing delivery ownership. A different
+valid token only enables tools and never enrolls an identity in webhook delivery.
 
 ## Tools
 
@@ -114,8 +211,9 @@ HTML are not read/rendered. Reading includes the account's own text.
 
 ## Incoming webhook
 
-The optional receiver gets POST JSON for all non-self new `m.text` in available
-rooms, regardless of whether the message addresses the account:
+Each configured receiver gets POST JSON for all non-self new `m.text` in rooms
+available to its configured Matrix identity, regardless of whether the message
+addresses that identity:
 
 ```json
 {
@@ -151,7 +249,7 @@ media, encrypted rooms and history pagination do not notify. Thread metadata is
 omitted. Redaction cannot erase a copy already received by the receiver.
 
 Delivery is serial and ordered through an in-memory queue of at most 100 items
-(including the active item). Overflow drops the newest incoming item with a safe
+(including the active item) per configured runtime. Overflow drops the newest incoming item with a safe
 diagnostic. Enrichment runs serially inside this same queue without blocking SDK
 sync. It uses the room's SDK timeline first, otherwise one authenticated SDK event
 request, bounded to two seconds including response-body transfer and aborted on
@@ -175,9 +273,11 @@ agent owns recovery by `read_messages`; the receiver owns routing/response polic
 ## Verification and boundaries
 
 `bun test` uses test-owned fake clients and local endpoints. Real MCP SDK clients
-exercise HTTP initialize/list/call. A real Matrix SDK connected to a local fake
-homeserver verifies timeline-before-sync ordering and startup/reconnect suppression
-through a local webhook. Typecheck, tests, build and Node executable help smoke
+exercise HTTP initialize/list/call. Real Matrix SDK clients connected to owned local fake
+homeservers verify credential isolation, readiness and timeline-before-sync
+ordering, plus independent webhook delivery and startup/reconnect suppression.
+Short injected registry timing verifies admission/capacity, idle ownership, failed
+creation, disconnect and shutdown cleanup. Typecheck, tests, build and Node executable help smoke
 require no real Matrix account. Actual homeserver interoperability remains
 unverified. E2EE, account/room management, thread APIs, media, read markers,
 edit/redaction writes, stdio, replay and deployment are outside this package.

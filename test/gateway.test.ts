@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { Matrix, record, TOTAL, type Event } from "../src/matrix.js";
 import { config } from "../src/config.js";
 import { listen } from "../src/mcp.js";
+import { AccessError } from "../src/registry.js";
 import { Webhook } from "../src/webhook.js";
 import type { MatrixClient } from "matrix-js-sdk";
 const base = {
@@ -56,8 +57,7 @@ function fake() {
   const room = {
     roomId: "!room:test",
     name: "Room",
-    getMember: (id: string) =>
-      names.has(id) ? { name: names.get(id) } : null,
+    getMember: (id: string) => (names.has(id) ? { name: names.get(id) } : null),
     getMyMembership: () => membership,
     currentState: { getStateEvents: () => (encrypted ? {} : null) },
     loadMembersIfNeeded: async () => {
@@ -122,30 +122,29 @@ function fake() {
     },
   };
 }
-test("config rejects unsafe endpoints and accepts short Matrix tokens", () => {
+test("config rejects unsafe endpoints and obsolete credentials", () => {
   expect(
-    config({
-      MATRIX_HOMESERVER_URL: "http://localhost:8008",
-      MATRIX_ACCESS_TOKEN: "x",
-    }).token,
-  ).toBe("x");
+    config({ MATRIX_HOMESERVER_URL: "http://localhost:8008" }).homeserver,
+  ).toBe("http://localhost:8008/");
   for (const patch of [
     { MATRIX_MCP_LISTEN: "0.0.0.0:8766" },
     { MATRIX_WEBHOOK_URL: "http://example.com" },
     { MATRIX_HOMESERVER_URL: "https://u:p@example.com" },
     { MATRIX_WEBHOOK_BEARER_TOKEN: "receiver" },
+    { MATRIX_ACCESS_TOKEN: "" },
   ])
     expect(() =>
-      config({
-        MATRIX_HOMESERVER_URL: "https://example.com",
-        MATRIX_ACCESS_TOKEN: "x",
-        ...patch,
-      }),
+      config({ MATRIX_HOMESERVER_URL: "https://example.com", ...patch }),
     ).toThrow();
 });
 test("public stateless HTTP MCP tools, auth, scope, sends and history", async () => {
   const f = fake(),
-    gateway = await listen(base, f.matrix);
+    gateway = await listen(base, {
+      async request(token) {
+        if (token !== "test-token") throw new AccessError(401);
+        return { matrix: f.matrix, release() {} };
+      },
+    });
   const url = new URL(
     `http://127.0.0.1:${(gateway.http.address() as any).port}/mcp`,
   );
@@ -205,11 +204,15 @@ test("public stateless HTTP MCP tools, auth, scope, sends and history", async ()
     const history = (await call("read_messages", { room_id: "!room:test" }))
       .value;
     expect(history.messages.map((m: any) => m.event_id)).toEqual([
-      "$self", "$new",
+      "$self",
+      "$new",
     ]);
     expect(
       history.messages.map((m: any) => [m.sender_id, m.sender_display_name]),
-    ).toEqual([["@self:test", ""], ["@other:test", "Other"]]);
+    ).toEqual([
+      ["@self:test", ""],
+      ["@other:test", "Other"],
+    ]);
     expect(
       (await call("read_messages", { room_id: "!room:test", before: "older" }))
         .value.messages[0].event_id,
@@ -304,12 +307,16 @@ test("history uses current names without loading members and budgets enriched re
   f.names.set("@other:test", undefined);
   const unnamed = await f.matrix.read("!room:test", 4, "older");
   expect(unnamed.messages).toHaveLength(4);
-  expect(unnamed.messages.every((m) => m.sender_display_name === "")).toBe(true);
+  expect(unnamed.messages.every((m) => m.sender_display_name === "")).toBe(
+    true,
+  );
   expect(unnamed.truncated).toBe(false);
   f.names.set("@other:test", "n".repeat(255));
   const named = await f.matrix.read("!room:test", 4, "older");
   expect(named.messages.map((m) => m.event_id)).toEqual([
-    "$budget3", "$budget2", "$budget1",
+    "$budget3",
+    "$budget2",
+    "$budget1",
   ]);
   expect(
     named.messages.every((m) => m.sender_display_name === "n".repeat(255)),
@@ -465,7 +472,10 @@ test("webhook ordered retry, overflow, exhaustion, redirects, timeout and shutdo
 
 test("webhook resumes when a message arrives as suppressed enrichment finishes", async () => {
   let posts = 0;
-  const receiver = await endpoint((_req, res) => { posts++; res.writeHead(204).end(); });
+  const receiver = await endpoint((_req, res) => {
+    posts++;
+    res.writeHead(204).end();
+  });
   const webhook = new Webhook(receiver.url);
   try {
     webhook.push(async () => null);
@@ -473,5 +483,8 @@ test("webhook resumes when a message arrives as suppressed enrichment finishes",
     webhook.push({ event_id: "$later" });
     await until(() => posts === 1);
     expect(posts).toBe(1);
-  } finally { await webhook.stop(); await receiver.close(); }
+  } finally {
+    await webhook.stop();
+    await receiver.close();
+  }
 });

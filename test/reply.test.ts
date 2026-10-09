@@ -80,7 +80,7 @@ async function fixture() {
   for (const server of [home, receiver])
     await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
   const url = (server: typeof home) => `http://127.0.0.1:${(server.address() as any).port}`;
-  const matrix = await Matrix.connect({ homeserver: url(home), token: "fake-account-token", host: "127.0.0.1", port: 0 });
+  const matrix = await Matrix.connect({ homeserver: url(home), token: "fake-account-token" });
   const fetchFn = matrix.client.http.opts.fetchFn ?? fetch;
   matrix.client.http.opts.fetchFn = (async (url: URL | RequestInfo, options?: RequestInit) => {
     const path = new URL(url instanceof Request ? url.url : url).pathname;

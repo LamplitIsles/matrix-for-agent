@@ -2,7 +2,8 @@ import { createServer, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { authorized, type Config } from "./config.js";
+import { bearer, type Config } from "./config.js";
+import { AccessError, type Lease, Registry } from "./registry.js";
 import { Matrix } from "./matrix.js";
 const id = z.string().min(1).max(255);
 export function tools(matrix: Matrix) {
@@ -83,12 +84,13 @@ export function tools(matrix: Matrix) {
   );
   return server;
 }
-export async function listen(c: Config, matrix: Matrix) {
+export async function listen(c: Config, registry: Pick<Registry, "request">) {
   const active = new Set<{
     server: McpServer;
     transport: StreamableHTTPServerTransport;
   }>();
   const json = (res: ServerResponse, status: number, message: string) => {
+    res.req.resume();
     res.writeHead(status, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
@@ -98,36 +100,84 @@ export async function listen(c: Config, matrix: Matrix) {
       }),
     );
   };
-  const http = createServer(async (req, res) => {
-    if (!authorized(req.headers.authorization, c.token)) {
+  const http = createServer({ maxHeaderSize: 32768 }, async (req, res) => {
+    const controller = new AbortController();
+    let lease: Lease | undefined;
+    const release = () => {
+      controller.abort();
+      lease?.release();
+    };
+    req.once("aborted", release);
+    res.once("close", release);
+    const token = bearer(req.headers.authorization);
+    const headerCount = req.rawHeaders.filter(
+      (_, i) =>
+        i % 2 === 0 && req.rawHeaders[i].toLowerCase() === "authorization",
+    ).length;
+    if (!token || headerCount !== 1) {
       json(res, 401, "Unauthorized");
       return;
     }
-    if (req.url !== "/mcp") {
-      json(res, 404, "Not found");
-      return;
-    }
-    if (req.method !== "POST") {
-      res.setHeader("Allow", "POST");
-      json(res, 405, "Method not allowed");
-      return;
-    }
+    const bodyTask = new Promise<string | undefined>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      const cleanup = () => {
+        req.off("data", data);
+        req.off("end", end);
+        req.off("error", error);
+        controller.signal.removeEventListener("abort", aborted);
+      };
+      const data = (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > 128000) {
+          cleanup();
+          req.resume();
+          resolve(undefined);
+        } else chunks.push(chunk);
+      };
+      const end = () => {
+        cleanup();
+        resolve(Buffer.concat(chunks).toString("utf8"));
+      };
+      const error = () => {
+        cleanup();
+        reject(new Error("Request failed"));
+      };
+      const aborted = () => error();
+      req.on("data", data);
+      req.once("end", end);
+      req.once("error", error);
+      controller.signal.addEventListener("abort", aborted, { once: true });
+      if (controller.signal.aborted) aborted();
+    });
+    void bodyTask.catch(() => {});
     let entry:
       | { server: McpServer; transport: StreamableHTTPServerTransport }
       | undefined;
     try {
-      const chunks: Buffer[] = [];
-      let bytes = 0;
-      for await (const chunk of req) {
-        const buffer = Buffer.from(chunk);
-        bytes += buffer.length;
-        if (bytes > 128000) {
-          json(res, 413, "Request too large");
-          return;
-        }
-        chunks.push(buffer);
+      lease = await registry.request(
+        token,
+        controller.signal,
+        req.url === "/mcp" && req.method === "POST",
+      );
+      if (controller.signal.aborted) {
+        lease.release();
+        return;
       }
-      const body = Buffer.concat(chunks).toString("utf8");
+      if (req.url !== "/mcp") {
+        json(res, 404, "Not found");
+        return;
+      }
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        json(res, 405, "Method not allowed");
+        return;
+      }
+      const body = await bodyTask;
+      if (body === undefined) {
+        json(res, 413, "Request too large");
+        return;
+      }
       let parsed;
       try {
         parsed = JSON.parse(body);
@@ -135,7 +185,7 @@ export async function listen(c: Config, matrix: Matrix) {
         json(res, 400, "Invalid JSON");
         return;
       }
-      const server = tools(matrix),
+      const server = tools(lease.matrix!),
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
           enableJsonResponse: true,
@@ -149,8 +199,13 @@ export async function listen(c: Config, matrix: Matrix) {
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, parsed);
-    } catch {
-      if (!res.headersSent) json(res, 500, "Request failed");
+    } catch (error) {
+      if (!res.headersSent && !res.destroyed)
+        json(
+          res,
+          error instanceof AccessError ? error.status : 500,
+          error instanceof AccessError ? error.message : "Request failed",
+        );
       if (entry) {
         active.delete(entry);
         await entry.server.close();

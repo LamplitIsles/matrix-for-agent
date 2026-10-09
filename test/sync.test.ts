@@ -110,8 +110,6 @@ test("real Matrix SDK startup/reconnect catch-up never reaches local webhook", a
   const matrix = await Matrix.connect({
     homeserver: url(home),
     token: "fake-account-token",
-    host: "127.0.0.1",
-    port: 0,
   });
   const webhook = new Webhook(url(receiver));
   const unobserve = matrix.observe((v, available) => webhook.push(v, available));
@@ -218,8 +216,6 @@ test("real Matrix SDK never retries a failed send after stop", async () => {
   const matrix = await Matrix.connect({
     homeserver: `http://127.0.0.1:${(home.address() as any).port}`,
     token: "fake-account-token",
-    host: "127.0.0.1",
-    port: 0,
   });
   // Exercise the real SDK send path without starting an unrelated sync loop.
   const sending = matrix.client

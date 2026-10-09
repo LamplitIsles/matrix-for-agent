@@ -14,7 +14,6 @@ import {
   type IRoomTimelineData,
 } from "matrix-js-sdk";
 import type { RoomMessageEventContent } from "matrix-js-sdk/lib/@types/events.js";
-import type { Config } from "./config.js";
 import type { WebhookItem } from "./webhook.js";
 // Raw events keep bounded history independent of SDK timeline aggregation/thread processing.
 export type Event = {
@@ -111,9 +110,14 @@ export class Matrix {
   identity!: { user_id: string; device_id?: string };
   private replyHttp?: MatrixClient["http"];
   private stopped = false;
+  private starting?: Promise<void>;
+  private lifetime = new AbortController();
   constructor(readonly client: MatrixClient) {}
-  static async connect(c: Config) {
-    // Suppress SDK diagnostics: SDK errors can contain request URLs/headers or event content.
+  static create(
+    c: { homeserver: string; token: string },
+    identity: Matrix["identity"],
+  ) {
+    // Suppress SDK diagnostics, which may include credentials or event content.
     const quiet = {
       trace() {},
       debug() {},
@@ -124,24 +128,55 @@ export class Matrix {
         return quiet;
       },
     };
-    // Avoid createClient: its default scheduler retains send retry timers after stop.
+    // No scheduler: uncertain sends must not be retried after stop.
+    const lifetime = new AbortController();
     const client = new MatrixClient({
       store: new MemoryStore(),
       baseUrl: c.homeserver,
       accessToken: c.token,
       localTimeoutMs: 10000,
       logger: quiet,
+      userId: identity.user_id,
+      fetchFn: (async (input: URL | RequestInfo, options?: RequestInit) => {
+        const response = await fetch(input, {
+          ...options,
+          signal: AbortSignal.any([
+            lifetime.signal,
+            ...(options?.signal ? [options.signal] : []),
+          ]),
+        });
+        return new Response(await response.arrayBuffer(), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      }) as typeof fetch,
     });
     const matrix = new Matrix(client);
+    matrix.lifetime = lifetime;
+    matrix.identity = identity;
+    return matrix;
+  }
+  static async connect(c: { homeserver: string; token: string }) {
+    const matrix = Matrix.create(c, { user_id: "" });
     try {
-      matrix.identity = await client.whoami();
-      client.credentials.userId = matrix.identity.user_id;
+      matrix.identity = await matrix.client.whoami();
+      matrix.client.credentials.userId = matrix.identity.user_id;
       return matrix;
     } catch {
-      client.stopClient();
-      client.http.abort();
+      matrix.stop();
       throw new Error("Matrix identity lookup failed");
     }
+  }
+  start() {
+    this.starting = this.client.startClient({ initialSyncLimit: 0 });
+    return this.starting.finally(() => {
+      this.starting = undefined;
+      // startClient awaits versions before installing sync/services. Do not call
+      // stopClient until that installation has finished, or its running guard
+      // would skip late-created SDK resources on the second stop.
+      if (this.stopped) this.client.stopClient();
+    });
   }
   room(id: string): Room {
     const r = this.client.getRoom(id);
@@ -394,8 +429,9 @@ export class Matrix {
   }
   stop() {
     this.stopped = true;
+    this.lifetime.abort();
     this.replyHttp?.abort();
-    this.client.stopClient();
+    if (!this.starting) this.client.stopClient();
     this.client.http.abort();
   }
 }
