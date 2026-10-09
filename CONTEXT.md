@@ -36,6 +36,13 @@ _Avoid_: Triggering message
 The external recipient of incoming Matrix notifications that decides how they contribute to agent context and whether an agent responds.
 _Avoid_: DSH Companion, Matrix device
 
+**Reply-target author**:
+The verified full Matrix user ID of the original message targeted by an ordinary
+reply in the same room. It is an incoming notification fact used by the receiver
+to decide reply wake. An omitted author means unknown; quoted text and display
+names do not establish authorship. Redaction may retain this fact.
+_Avoid_: Mention, trigger policy, display name
+
 **Message edit**:
 A replacement of a message's content by its original author, related to the original message event.
 _Avoid_: New message

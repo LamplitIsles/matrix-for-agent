@@ -462,3 +462,16 @@ test("webhook ordered retry, overflow, exhaustion, redirects, timeout and shutdo
     await hanging.close();
   }
 });
+
+test("webhook resumes when a message arrives as suppressed enrichment finishes", async () => {
+  let posts = 0;
+  const receiver = await endpoint((_req, res) => { posts++; res.writeHead(204).end(); });
+  const webhook = new Webhook(receiver.url);
+  try {
+    webhook.push(async () => null);
+    await Promise.resolve();
+    webhook.push({ event_id: "$later" });
+    await until(() => posts === 1);
+    expect(posts).toBe(1);
+  } finally { await webhook.stop(); await receiver.close(); }
+});

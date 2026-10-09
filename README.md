@@ -128,18 +128,39 @@ rooms, regardless of whether the message addresses the account:
   "body": "Hello",
   "mentions": [],
   "reply_to_event_id": "$parent",
+  "reply_to_sender_id": "@agent:example.org",
   "truncated": false
 }
 ```
 
-`reply_to_event_id` is optional. Display names are bounded to 255 characters;
+`reply_to_event_id` and `reply_to_sender_id` are optional. The author field is
+present only with a nonempty target ID and a verified original `m.room.message`
+target in the same room. It is the exact full Matrix user ID, at most 255 UTF-16
+code units, matching `/^@[^\s:]+:[^\s]+$/u`; it is never clipped or inferred from
+quoted text or names. Redacted targets may retain their author; their content is
+not forwarded. An unavailable, malformed or mismatched target omits the author,
+meaning unknown. Receivers must reject invalid/orphan author fields and decide
+wake policy themselves: matching their own full identity permits reply wake;
+other/unknown targets do not. Mention takes precedence over reply, then configured
+alias. Self echoes and blank text must never wake; DMs have no implicit wake.
+History/MCP records do not gain this field.
+
+Display names are bounded to 255 characters;
 body/mentions use reading's field bounds. Own echoes, edits, redactions, reactions,
 media, encrypted rooms and history pagination do not notify. Thread metadata is
 omitted. Redaction cannot erase a copy already received by the receiver.
 
 Delivery is serial and ordered through an in-memory queue of at most 100 items
 (including the active item). Overflow drops the newest incoming item with a safe
-diagnostic. Each item gets at most three attempts, each with a five-second timeout,
+diagnostic. Enrichment runs serially inside this same queue without blocking SDK
+sync. It uses the room's SDK timeline first, otherwise one authenticated SDK event
+request, bounded to two seconds including response-body transfer and aborted on
+timeout/shutdown. No profile lookup or separate author cache is used. Room
+membership/encryption is checked again after lookup and before each POST;
+unavailable rooms discard pending delivery. Enrichment and serialization occur
+once before retries, so
+retry bodies are identical. With webhook disabled no enrichment runs.
+Each item gets at most three attempts, each with a five-second timeout,
 with 250ms between attempts. Redirects are disabled; any 2xx acknowledges receipt.
 Exhaustion drops the item with a diagnostic and continues. The receiver should
 deduplicate by `room_id` + `event_id`, because retries can deliver duplicates.

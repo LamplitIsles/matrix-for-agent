@@ -15,7 +15,9 @@ if (process.argv.includes("--help")) {
     const c = config(process.env);
     matrix = await Matrix.connect(c);
     webhook = c.webhook ? new Webhook(c.webhook, c.webhookToken) : undefined;
-    unobserve = matrix.observe((value) => webhook?.push(value));
+    unobserve = webhook
+      ? matrix.observe((value, available) => webhook!.push(value, available))
+      : undefined;
     await matrix.client.startClient({ initialSyncLimit: 0 });
     const gateway = await listen(c, matrix);
     let stopping = false;

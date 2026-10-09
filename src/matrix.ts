@@ -1,5 +1,6 @@
 import {
   MatrixClient,
+  MatrixHttpApi,
   MemoryStore,
   ClientEvent,
   Direction,
@@ -7,12 +8,14 @@ import {
   MsgType,
   RoomEvent,
   SyncState,
+  Method,
   type Room,
   type MatrixEvent,
   type IRoomTimelineData,
 } from "matrix-js-sdk";
 import type { RoomMessageEventContent } from "matrix-js-sdk/lib/@types/events.js";
 import type { Config } from "./config.js";
+import type { WebhookItem } from "./webhook.js";
 // Raw events keep bounded history independent of SDK timeline aggregation/thread processing.
 export type Event = {
   event_id?: string;
@@ -106,6 +109,8 @@ export function record(event: Event, page: Event[] = []) {
 }
 export class Matrix {
   identity!: { user_id: string; device_id?: string };
+  private replyHttp?: MatrixClient["http"];
+  private stopped = false;
   constructor(readonly client: MatrixClient) {}
   static async connect(c: Config) {
     // Suppress SDK diagnostics: SDK errors can contain request URLs/headers or event content.
@@ -252,8 +257,61 @@ export class Matrix {
       incomplete: true,
     };
   }
-  observe(deliver: (value: unknown) => void) {
+  private async replySender(roomId: string, eventId: string, signal: AbortSignal) {
+    const room = this.room(roomId);
+    let target: unknown = room.findEventById(eventId)?.event;
+    if (!target) {
+      try {
+        // Only reply lookup uses this SDK HTTP adapter. Its inherited account
+        // options authenticate with the shared client; sync/MCP transport stays intact.
+        // The SDK detaches abort listeners at headers, so consume the body before
+        // returning to keep its request abort/timeout active through JSON transfer.
+        this.replyHttp ??= new MatrixHttpApi(this.client, {
+          ...this.client.http.opts,
+          fetchFn: (async (url: URL | RequestInfo, options?: RequestInit) => {
+            const response = await this.client.http.fetch(
+              url instanceof Request ? url.url : url,
+              options,
+            );
+            return new Response(await response.arrayBuffer(), {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            });
+          }) as typeof fetch,
+        });
+        target = await this.replyHttp.authedRequest(
+          Method.Get,
+          `/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(eventId)}`,
+          {},
+          undefined,
+          { abortSignal: signal, localTimeoutMs: 2000 },
+        );
+      } catch {
+        return undefined;
+      }
+    }
+    if (!target || typeof target !== "object") return undefined;
+    const event = target as Event;
+    return (
+      event.event_id === eventId &&
+      (event.room_id === undefined || event.room_id === roomId) &&
+      event.type === "m.room.message" &&
+      event.state_key === undefined &&
+      event.content !== null &&
+      typeof event.content === "object" &&
+      !Array.isArray(event.content) &&
+      event.content?.["m.relates_to"]?.rel_type !== "m.replace" &&
+      typeof event.sender === "string" &&
+      event.sender.length <= 255 &&
+      /^@[^\s:]+:[^\s]+$/u.test(event.sender)
+    )
+      ? event.sender
+      : undefined;
+  }
+  observe(deliver: (value: WebhookItem, available: () => boolean) => void) {
     let live = false;
+    const abort = new AbortController();
     const onSync = (
       state: SyncState,
       _prev: SyncState | null,
@@ -290,7 +348,7 @@ export class Matrix {
         incomplete: _incomplete,
         ...fields
       } = message;
-      deliver({
+      const value = {
         type: "message",
         room_id: room.roomId,
         sender_display_name: clip(
@@ -298,16 +356,45 @@ export class Matrix {
           255,
         ),
         ...fields,
-      });
+      };
+      const originalReply = e.event.content?.["m.relates_to"]?.["m.in_reply_to"]?.event_id;
+      // Only queue work here; SDK sync remains free to apply later room state.
+      const available = () => {
+        if (abort.signal.aborted || this.stopped) return false;
+        try { this.room(room.roomId); return true; } catch { return false; }
+      };
+      deliver(async (signal) => {
+        const combined = AbortSignal.any([signal, abort.signal]);
+        if (combined.aborted || this.stopped) return null;
+        try {
+          this.room(room.roomId);
+          const sender =
+            fields.reply_to_event_id && originalReply === fields.reply_to_event_id
+              ? await this.replySender(
+                  room.roomId,
+                  fields.reply_to_event_id,
+                  AbortSignal.any([combined, AbortSignal.timeout(2000)]),
+                )
+              : undefined;
+          if (combined.aborted || this.stopped) return null;
+          this.room(room.roomId);
+          return { ...value, ...(sender ? { reply_to_sender_id: sender } : {}) };
+        } catch {
+          return null;
+        }
+      }, available);
     };
     this.client.on(ClientEvent.Sync, onSync);
     this.client.on(RoomEvent.Timeline, onTimeline);
     return () => {
+      abort.abort();
       this.client.removeListener(ClientEvent.Sync, onSync);
       this.client.removeListener(RoomEvent.Timeline, onTimeline);
     };
   }
   stop() {
+    this.stopped = true;
+    this.replyHttp?.abort();
     this.client.stopClient();
     this.client.http.abort();
   }

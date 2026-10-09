@@ -114,7 +114,7 @@ test("real Matrix SDK startup/reconnect catch-up never reaches local webhook", a
     port: 0,
   });
   const webhook = new Webhook(url(receiver));
-  const unobserve = matrix.observe((v) => webhook.push(v));
+  const unobserve = matrix.observe((v, available) => webhook.push(v, available));
   const states: string[] = [];
   matrix.client.on(ClientEvent.Sync, (s) => states.push(s));
   const respond = async (value: unknown, status = 200) => {
