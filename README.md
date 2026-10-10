@@ -218,6 +218,7 @@ addresses that identity:
 ```json
 {
   "type": "message",
+  "conversation_type": "dm",
   "event_id": "$event",
   "room_id": "!room:example.org",
   "sender_id": "@alice:example.org",
@@ -240,8 +241,34 @@ not forwarded. An unavailable, malformed or mismatched target omits the author,
 meaning unknown. Receivers must reject invalid/orphan author fields and decide
 wake policy themselves: matching their own full identity permits reply wake;
 other/unknown targets do not. Mention takes precedence over reply, then configured
-alias. Self echoes and blank text must never wake; DMs have no implicit wake.
-History/MCP records do not gain this field.
+alias for ordinary rooms. Self echoes and blank text must never wake.
+History/MCP records do not gain these notification facts.
+
+`conversation_type` is always exactly `"dm"` or `"room"`. A DM is a room ID
+in an array in the configured account's synchronized `m.direct` account data.
+Malformed entries are ignored; absent or unusable markings mean `"room"`.
+Classification uses neither room names nor participant counts. A marked DM may
+have more than two members, and two configured identities can classify the same
+room differently. The fact is captured at live timeline admission, before queued
+reply enrichment; marking changes affect subsequent events and never retry bytes.
+
+Operators must manually accept/join an invitation and mark the intended plaintext
+room as direct in their Matrix client **for the configured gateway account**.
+The gateway does not join invitations or write account data. Unmarked rooms retain
+receiver group rules; the DM allow list is not universal two-person-room access
+control. Encryption and media remain excluded.
+
+Each receiver owns its exact full Matrix sender-ID allow list: Chat/Hosted
+`matrix.dmAllowList`, CFL `[matrix].dm_allow_list`. Missing/empty lists deny all
+marked DMs. Lists allow at most 64 unique full IDs of at most 255 UTF-16 units,
+without trimming, case folding, wildcards or display-name matching. Allowed
+nonself, nonblank DM text automatically wakes; denied DM bodies must be rejected
+before context, queue, model input, history or original-payload retention, even
+when they mention, reply to or alias the agent. The gateway still sends both
+allowed and denied senders' notifications: it reports facts, not receiver policy.
+Generic MCP authorization and tool reads/sends remain independent; dynamic MCP
+callers never acquire webhooks. Receiver rollout must support this field before
+new producer notifications are used. No deployment or historical purge is implied.
 
 Display names are bounded to 255 characters;
 body/mentions use reading's field bounds. Own echoes, edits, redactions, reactions,

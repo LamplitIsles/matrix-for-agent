@@ -383,8 +383,23 @@ export class Matrix {
         incomplete: _incomplete,
         ...fields
       } = message;
+      // Account data is synchronized before room timelines. Snapshot now, before
+      // queued reply lookup: later marking changes must not reclassify this item.
+      const direct: unknown = this.client
+        .getAccountData(EventType.Direct)
+        ?.getContent();
+      const conversation_type =
+        direct &&
+        typeof direct === "object" &&
+        !Array.isArray(direct) &&
+        Object.values(direct).some(
+          (rooms) => Array.isArray(rooms) && rooms.some((id) => id === room.roomId),
+        )
+          ? "dm"
+          : "room";
       const value = {
         type: "message",
+        conversation_type,
         room_id: room.roomId,
         sender_display_name: clip(
           room.getMember(e.getSender() ?? "")?.name,

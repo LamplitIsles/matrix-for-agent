@@ -16,6 +16,12 @@ _Avoid_: Matrix identity, agent
 A Matrix conversation space identified by a room ID. Its display name may change and is not its identity.
 _Avoid_: Channel, destination name
 
+**Direct room**:
+A room marked in synchronized `m.direct` account data for the observed Matrix
+identity. This is an account-relative conversation fact, not a two-member
+constraint or sender authorization. A receiver separately admits exact sender IDs.
+_Avoid_: Private room, allowed sender, two-person room
+
 **Event**:
 A Matrix record identified by an event ID within a room. Messages, edits, reactions, and room-state changes are distinct event types.
 _Avoid_: Message when referring to all event types

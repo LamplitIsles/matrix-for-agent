@@ -507,6 +507,7 @@ test("two configured real SDK accounts notify independently, reuse exact credent
     ] as const) {
       expect(JSON.parse(received[i][0].bytes)).toEqual({
         type: "message",
+        conversation_type: "room",
         event_id: "$reply-" + token,
         room_id: `!${token}:test`,
         sender_id: "@other:test",
